@@ -292,6 +292,24 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, dry_run=False, verbo
     return counts
 
 
+def dump_lines(input_pdf, file=sys.stdout):
+    """Print the exact text the matcher sees: each page's visual lines (the
+    reconstructed text both passes run against) plus the underlying word boxes
+    and their x-positions. Use this to see how a stubborn value is laid out --
+    e.g. whether its digits land on one line or get split across several -- and
+    share it safely by X-ing out the actual digits.
+    """
+    doc = pymupdf.open(input_pdf)
+    for page_index, page in enumerate(doc, start=1):
+        lines = _build_lines(page)
+        print(f"=== page {page_index} ({len(lines)} lines) ===", file=file)
+        for ln in lines:
+            print(f"  y={ln['y0']:7.1f}  text: {ln['text']!r}", file=file)
+            boxes = "  ".join(f"{w[4]}@{w[0]:.0f}" for w in ln["words"])
+            print(f"             boxes: {boxes}", file=file)
+    doc.close()
+
+
 def default_output(input_path):
     """foo.pdf -> foo.redacted.pdf"""
     return input_path.with_suffix(".redacted" + input_path.suffix)
@@ -330,6 +348,10 @@ def parse_args(argv=None):
         "-v", "--verbose", action="store_true",
         help="print each matched item and its page",
     )
+    parser.add_argument(
+        "--dump", action="store_true",
+        help="print the reconstructed text the matcher sees, then exit (for diagnosing misses)",
+    )
     return parser.parse_args(argv)
 
 
@@ -345,6 +367,10 @@ def main(argv=None):
 
     if not args.input.is_file():
         sys.exit(f"error: input file not found: {args.input}")
+
+    if args.dump:
+        dump_lines(args.input)
+        return
 
     if args.dry_run:
         output = None

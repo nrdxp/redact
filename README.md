@@ -17,7 +17,14 @@ dependency (`pymupdf`) on first run, so there's nothing to install.
 ./redact-ssn.py return.pdf --in-place      # overwrite the original (written via a temp file first)
 ./redact-ssn.py return.pdf --dry-run -v    # list what would be redacted, write nothing
 ./redact-ssn.py return.pdf --force         # overwrite an existing output file
+./redact-ssn.py return.pdf --dump          # print the text the matcher sees, then exit
 ```
+
+`--dump` prints, per page, each reconstructed visual line (the exact text both
+passes match against) plus the underlying word boxes and their x-positions. Use
+it to diagnose a value that isn't being caught — it shows whether the digits
+land on one line or get split across several — and it's safe to share once you
+X out the actual digits.
 
 ## What it matches
 

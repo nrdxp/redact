@@ -9,6 +9,7 @@ pulls in pymupdf. Fixtures are generated on the fly in a temp dir, so no PDFs
     ./tests/run-tests.py
 """
 import importlib.util
+import io
 import re
 import sys
 import tempfile
@@ -238,6 +239,18 @@ def learned_ssn_redacted_even_when_bare_elsewhere():
 
 
 # --- cosmetics ------------------------------------------------------------
+
+@test
+def dump_lines_shows_reconstructed_text():
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "in.pdf"
+        make_pdf(src, [[(72, 60, "Account: 1234567890")]])
+        buf = io.StringIO()
+        redact_ssn.dump_lines(src, file=buf)
+        out = buf.getvalue()
+        assert "page 1" in out
+        assert "1234567890" in out  # the raw text the matcher sees
+
 
 @test
 def value_split_across_boxes_redacts_as_single_strip():
