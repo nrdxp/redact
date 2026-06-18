@@ -326,8 +326,7 @@ def ocr_recovers_text_without_a_text_layer():
             (72, 140, "Account number: 1234567890"),
         ])
         # Without OCR there's no text to match, so nothing is redacted.
-        assert redact_ssn.redact_pdf(src, out, redact_bank=True) == {
-            "ssn": 0, "routing": 0, "account": 0}
+        assert not sum(redact_ssn.redact_pdf(src, out, redact_bank=True).values())
         # With OCR the rendered numbers are found and redacted.
         counts = redact_ssn.redact_pdf(src, out, redact_bank=True, ocr="all")
         assert counts["account"] >= 1 and counts["routing"] >= 1, counts
@@ -367,6 +366,30 @@ def ocr_page_is_flattened_without_corrupting_other_content():
         doc.close()
         assert "Direct Deposit" in text, repr(text)
         assert "1234567890" not in re.sub(r"\D", "", text), repr(text)
+
+
+@test
+def extra_values_are_redacted_numeric_and_text():
+    with tempfile.TemporaryDirectory() as tmp:
+        counts, texts = run(tmp, [[
+            (72, 60, "Confirmation 9988-776-655"),    # numeric, dashed
+            (72, 90, "Filed by Jane Q. Public"),       # text phrase
+            (72, 120, "Unrelated Publication note"),   # must NOT match "Public"
+        ]], extra=["9988776655", "Jane Q. Public"])
+        t = texts[0]
+        assert counts["custom"] == 2, counts
+        assert "9988776655" not in digits(t)            # matched despite dashes
+        assert "Jane Q. Public" not in t
+        assert "Publication" in t                        # word-bounded, no overmatch
+
+
+@test
+def extra_text_match_is_case_insensitive():
+    with tempfile.TemporaryDirectory() as tmp:
+        counts, texts = run(tmp, [[(72, 60, "Owner: ACME HOLDINGS LLC")]],
+                            extra=["acme holdings llc"])
+        assert counts["custom"] == 1, counts
+        assert "ACME HOLDINGS LLC" not in texts[0]
 
 
 @test

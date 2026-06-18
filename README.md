@@ -1,9 +1,9 @@
 # redact-ssn
 
 A small, self-contained CLI that redacts U.S. Social Security Numbers — and,
-optionally, bank account/routing numbers — from a PDF. It removes the
-underlying text, not just drawing a box over it, so the digits can't be
-recovered by copy/paste or text extraction.
+optionally, bank account/routing numbers or any values you name — from a PDF. It
+removes the underlying text, not just drawing a box over it, so the content can't
+be recovered by copy/paste or text extraction.
 
 ## Usage
 
@@ -14,6 +14,7 @@ install.
 ```sh
 ./redact-ssn.py return.pdf                 # -> return.redacted.pdf (won't clobber the original)
 ./redact-ssn.py return.pdf --bank          # also redact account + routing numbers
+./redact-ssn.py return.pdf -r "Jane Doe" -r 555123456   # also redact these exact values
 ./redact-ssn.py return.pdf -o clean.pdf    # explicit output path
 ./redact-ssn.py return.pdf --in-place      # overwrite the original (written via a temp file first)
 ./redact-ssn.py return.pdf --dry-run -v    # list what would be redacted, write nothing
@@ -121,6 +122,30 @@ part most worth checking with `--dry-run -v` against your specific forms. The
 window for "beneath the label" is intentionally tight (about two lines) to
 avoid sweeping in an unrelated number from further down the page; if a value
 on your form sits lower than that, the window is easy to widen.
+
+## Ad-hoc values (`-r` / `--redact`)
+
+For the one-off things the heuristics can't know about — a particular name, an
+address, a confirmation number — pass `--redact VALUE`. The flag is repeatable,
+and each value is redacted everywhere it appears, seeded into the same sweep that
+propagates the auto-detected values:
+
+```sh
+./redact-ssn.py return.pdf -r "Jane Q. Public" -r 9988776655 -r "123 Main St"
+```
+
+Matching adapts to the value:
+
+- **Numeric** (digits and separators only) is matched like a learned number —
+  its digits in order, any separators ignored — so `9988776655` also catches
+  `9988-776-655` or `99 88 77 66 55`.
+- **Text** is matched case-insensitively and whitespace-flexibly, word-bounded on
+  its edges so `Smith` doesn't catch `Smithsonian`.
+
+Matches are reported under a `custom` count. Two caveats: a very short value
+(e.g. `42`) will match broadly, and an ad-hoc value hidden in unreadable drawn
+boxes on an OCR'd page won't be found (only the label-anchored bank fallback
+covers those). As always, `--dry-run -v` shows exactly what was hit.
 
 ## Document-wide consistency
 

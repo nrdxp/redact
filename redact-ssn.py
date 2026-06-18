@@ -83,6 +83,32 @@ def _qualifies(kind, digits):
     return ACCOUNT_MIN_DIGITS <= len(digits) <= ACCOUNT_MAX_DIGITS
 
 
+# Separators ignored between the digits of a number when sweeping for it.
+DIGIT_SEP = r"[^0-9A-Za-z]*"
+
+
+def _extra_pattern(value):
+    """Compile a matcher for a user-supplied --redact value, or None if empty.
+
+    A numeric value (digits and separators only) is matched like a learned
+    number: its digits in order, any separators between them ignored, bounded so
+    it isn't part of a longer number. Anything containing letters is matched as
+    text: case-insensitive and whitespace-flexible, word-bounded on its
+    alphanumeric edges so "Smith" doesn't catch "Smithsonian".
+    """
+    value = value.strip()
+    digits = re.sub(r"\D", "", value)
+    if digits and not re.search(r"[A-Za-z]", value):
+        return re.compile(r"(?<!\d)" + DIGIT_SEP.join(digits) + r"(?!\d)")
+    tokens = value.split()
+    if not tokens:
+        return None
+    body = r"\s+".join(re.escape(t) for t in tokens)
+    pre = r"\b" if value[0].isalnum() else ""
+    post = r"\b" if value[-1].isalnum() else ""
+    return re.compile(pre + body + post, re.IGNORECASE)
+
+
 OCR_DPI = 300  # render resolution for OCR; high enough for small digits
 
 
@@ -362,7 +388,8 @@ def _iter_bank(lines, page_rect, surplus, positional):
                 yield "region", kind, None, rect
 
 
-def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=False, verbose=False):
+def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, extra=None,
+               dry_run=False, verbose=False):
     """Redact sensitive data in *input_pdf*, writing to *output_pdf*.
 
     Works in two passes. The first applies the contextual rules (SSN pattern,
@@ -374,8 +401,9 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=Fa
     redacted consistently throughout even where it lacks identifying context.
 
     *ocr* (None / "auto" / "all") controls OCR for pages whose embedded text is
-    unreadable (broken font encoding) or absent (scanned). Returns a dict of
-    per-category counts.
+    unreadable (broken font encoding) or absent (scanned). *extra* is a list of
+    user-supplied values to redact everywhere they occur, alongside the values
+    the rules find. Returns a dict of per-category counts.
     """
     doc = pymupdf.open(input_pdf)
     tessdata = _find_tessdata() if ocr else None
@@ -398,7 +426,7 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=Fa
         page_views.append(views)
         page_was_ocr.append(used_ocr)
 
-    counts = {"ssn": 0, "routing": 0, "account": 0}
+    counts = {"ssn": 0, "routing": 0, "account": 0, "custom": 0}
     page_redacted = [set() for _ in page_views]  # boxes marked, per page
 
     def record(page_index, kind, ok, label):
@@ -437,11 +465,15 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=Fa
     # however it's punctuated. Bounds are digit-only lookarounds rather than \b:
     # that still prevents matching as part of a longer *number*, but -- unlike
     # \b -- still matches when the number abuts a letter (e.g. "Acct1234567890").
-    sep = r"[^0-9A-Za-z]*"
     patterns = [
-        (re.compile(r"(?<!\d)" + sep.join(seq) + r"(?!\d)"), kind)
+        (re.compile(r"(?<!\d)" + DIGIT_SEP.join(seq) + r"(?!\d)"), kind)
         for seq, kind in known.items()
     ]
+    # User-supplied ad-hoc values are swept the same way, reported as "custom".
+    for value in extra or []:
+        pat = _extra_pattern(value)
+        if pat is not None:
+            patterns.append((pat, "custom"))
     for page_index, views in enumerate(page_views):
         page = doc[page_index]
         redacted = page_redacted[page_index]
@@ -515,6 +547,11 @@ def parse_args(argv=None):
         "--bank", action="store_true",
         help="also redact account and routing numbers found next to a label",
     )
+    parser.add_argument(
+        "-r", "--redact", action="append", metavar="VALUE", dest="extra",
+        help="also redact this exact value everywhere it appears; repeatable "
+             "(numbers match regardless of separators, text matches case-insensitively)",
+    )
 
     dest = parser.add_mutually_exclusive_group()
     dest.add_argument(
@@ -559,7 +596,8 @@ def _ocr_mode(args):
 
 def _summary(counts):
     """Render per-category counts, e.g. '3 SSN, 1 routing, 2 account'."""
-    labels = [("ssn", "SSN"), ("routing", "routing"), ("account", "account")]
+    labels = [("ssn", "SSN"), ("routing", "routing"), ("account", "account"),
+              ("custom", "custom")]
     parts = [f"{counts[key]} {name}" for key, name in labels if counts[key]]
     return ", ".join(parts) if parts else "nothing"
 
@@ -593,7 +631,8 @@ def main(argv=None):
         if args.in_place and not args.dry_run:
             # Redact to a temp file first so a failure can't corrupt the original.
             tmp = args.input.with_suffix(args.input.suffix + ".tmp")
-            counts = redact_pdf(args.input, tmp, redact_bank=args.bank, ocr=ocr, verbose=args.verbose)
+            counts = redact_pdf(args.input, tmp, redact_bank=args.bank, ocr=ocr,
+                                extra=args.extra, verbose=args.verbose)
             if sum(counts.values()):
                 tmp.replace(args.input)
             elif tmp.exists():
@@ -601,7 +640,7 @@ def main(argv=None):
         else:
             counts = redact_pdf(
                 args.input, output, redact_bank=args.bank, ocr=ocr,
-                dry_run=args.dry_run, verbose=args.verbose,
+                extra=args.extra, dry_run=args.dry_run, verbose=args.verbose,
             )
     except Exception as exc:  # pymupdf raises a variety of error types
         sys.exit(f"error: failed to process {args.input}: {exc}")
