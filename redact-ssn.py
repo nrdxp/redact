@@ -47,9 +47,12 @@ LABEL_REGEX = re.compile(
     re.I,
 )
 
-# Render-resolution / layout constants for the OCR region fallback.
-BAND_MAX_LINES = 2.5  # how far below a heading to redact when its value is unreadable
+# Layout constants for the OCR region fallback (in PDF points, so they don't
+# get distorted by OCR's inflated line heights).
+BAND_MAX_PT = 28      # how far below a heading to redact when its value is unreadable
+MIN_BAND_PT = 12      # ... but always at least this far (never an empty band)
 REGION_MARGIN = 36    # right-side page margin left untouched by a region redaction
+FLATTEN_DPI = 200     # resolution when replacing an OCR'd page with a redacted image
 
 # A run of digits with optional space/dash separators (e.g. "12 3456 789",
 # "021-000-021"); the count of digits is checked separately per field type.
@@ -219,6 +222,34 @@ def _redact_region(page, rect, redacted, dry_run):
     return True
 
 
+def _flatten_page_redactions(page):
+    """Apply this page's pending redaction annotations by replacing the whole
+    page with a rendered image that has the redactions painted in.
+
+    Used for OCR'd pages: their fonts are broken (that's why we OCR'd), and
+    PyMuPDF's normal apply_redactions rewrites the content stream, which mangles
+    that broken text and drops unrelated content. Rendering to an image instead
+    keeps the page looking exactly as it did, drops the text layer entirely (so
+    nothing -- redacted or not -- is copyable), and bakes the black boxes in.
+    """
+    boxes = [annot.rect for annot in page.annots(types=[pymupdf.PDF_ANNOT_REDACT])]
+    if not boxes:
+        return
+    for annot in list(page.annots(types=[pymupdf.PDF_ANNOT_REDACT])):
+        page.delete_annot(annot)
+    shape = page.new_shape()
+    for rect in boxes:
+        shape.draw_rect(rect)
+    shape.finish(fill=(0, 0, 0), color=(0, 0, 0))
+    shape.commit()
+    pix = page.get_pixmap(dpi=FLATTEN_DPI)
+    # Wipe all existing content (text/vector/images), then lay the render back as
+    # the page's only content -- an image, with no recoverable text.
+    page.add_redact_annot(page.rect)
+    page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_REMOVE)
+    page.insert_image(page.rect, pixmap=pix)
+
+
 def _find_value(words, kind):
     """First qualifying value among *words* (reading order), or None.
 
@@ -319,14 +350,14 @@ def _iter_bank(lines, page_rect, surplus, positional):
             elif positional and lm.group("suffix"):
                 # Couldn't read the digits, but this is a field heading ("...
                 # Number") on a page we had to OCR -- the value is almost
-                # certainly in drawn boxes OCR can't read. Redact the band just
-                # below the heading, down to the next heading (capped), so the
-                # boxed digits are covered even though we never read them.
-                y_top = line["y1"]
-                lower = [y for y in heading_ys if y > line["y1"] + 1]
-                y_bot = min([y_top + BAND_MAX_LINES * line_h] + lower[:1])
-                y_bot = max(y_bot, y_top + 1.2 * line_h)  # never an empty band
-                rect = pymupdf.Rect(lx0, y_top, page_rect.width - REGION_MARGIN, y_bot)
+                # certainly in drawn boxes OCR can't read. Cover from the heading
+                # down a fixed band (capped at the next heading), full width, so
+                # the boxed digits are covered whether they sit to the right of
+                # the heading or beneath it -- even though we never read them.
+                lower = [y for y in heading_ys if y > line["y0"] + 1]
+                y_bot = min([line["y1"] + BAND_MAX_PT] + lower[:1])
+                y_bot = max(y_bot, line["y1"] + MIN_BAND_PT)  # never an empty band
+                rect = pymupdf.Rect(lx0, line["y0"], page_rect.width - REGION_MARGIN, y_bot)
                 surplus[0] += 1 if kind == "routing" else -1
                 yield "region", kind, None, rect
 
@@ -355,14 +386,17 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=Fa
     # so normal matching keeps working everywhere. Each view carries whether its
     # boxes came from OCR (which enables the region fallback for that view).
     page_views = []  # page_index -> list of (lines, from_ocr)
+    page_was_ocr = []  # whether OCR was added for each page
     for page_index, page in enumerate(doc):
         normal = page.get_text("words")
         views = [(_build_lines(page, normal), False)]
-        if ocr and _should_ocr(normal, ocr):
+        used_ocr = bool(ocr and _should_ocr(normal, ocr))
+        if used_ocr:
             if verbose:
                 print(f"  page {page_index + 1}: adding OCR coverage", file=sys.stderr)
             views.append((_build_lines(page, _ocr_words(page, tessdata)), True))
         page_views.append(views)
+        page_was_ocr.append(used_ocr)
 
     counts = {"ssn": 0, "routing": 0, "account": 0}
     page_redacted = [set() for _ in page_views]  # boxes marked, per page
@@ -419,13 +453,18 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=Fa
                         record(page_index, kind, ok, m.group().strip())
 
     # Apply only on pages that actually have a redaction, so untouched pages are
-    # written back byte-for-byte and their formatting is never disturbed. Pin the
-    # mode: TEXT_REMOVE deletes the underlying text (not copyable/extractable, not
-    # just hidden); IMAGE_PIXELS blanks only the covered pixels of any image.
+    # left exactly as they were. OCR'd pages (broken fonts) are flattened to an
+    # image so the content-stream rewrite can't mangle their text; other pages
+    # use a normal in-place redaction, which keeps their text selectable. Either
+    # way the underlying content is removed (not copyable), not just hidden.
     if not dry_run:
         for page_index in range(len(page_views)):
             page = doc[page_index]
-            if next(page.annots(types=[pymupdf.PDF_ANNOT_REDACT]), None) is not None:
+            if next(page.annots(types=[pymupdf.PDF_ANNOT_REDACT]), None) is None:
+                continue
+            if page_was_ocr[page_index]:
+                _flatten_page_redactions(page)
+            else:
                 page.apply_redactions(
                     text=pymupdf.PDF_REDACT_TEXT_REMOVE,
                     images=pymupdf.PDF_REDACT_IMAGE_PIXELS,

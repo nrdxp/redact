@@ -41,10 +41,16 @@ rendered digits regardless of the broken encoding underneath.
 
 OCR is **strictly additive**: it never replaces a page's real text layer, it
 only adds coverage where that text is unreadable. So normal text matching keeps
-working everywhere, even on pages that also get OCR'd. OCR is used only to learn
-*where* to redact — it never rewrites or reflows the page. And pages with
-nothing to redact are written back untouched; only pages that actually have a
-redaction are modified.
+working everywhere, even on pages that also get OCR'd. Pages with nothing to
+redact are written back untouched.
+
+How an OCR'd page is redacted matters: its font is broken (that's why we OCR'd),
+and PyMuPDF's normal in-place redaction rewrites the content stream, which
+mangles that broken text and can drop unrelated content. So an OCR'd page that
+needs redacting is instead **flattened to an image** — rendered exactly as it
+looks, with the black boxes painted in, and no text layer at all. The page looks
+identical, nothing on it is copyable, and nothing else is disturbed. (Normal
+pages keep their selectable text and are redacted in place as before.)
 
 ```sh
 ./redact-ssn.py return.pdf --bank --ocr            # OCR only the unreadable pages

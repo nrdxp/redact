@@ -342,6 +342,34 @@ def ocr_recovers_text_without_a_text_layer():
 
 
 @test
+def ocr_page_is_flattened_without_corrupting_other_content():
+    # On an OCR'd page we render to an image instead of rewriting the content
+    # stream. Result: no text layer survives (nothing copyable), and the
+    # non-redacted content is still visually present (not dropped).
+    with tempfile.TemporaryDirectory() as tmp:
+        src, out = Path(tmp) / "in.pdf", Path(tmp) / "out.pdf"
+        make_image_pdf(src, [
+            (60, 60, "Direct Deposit"),
+            (60, 100, "Routing number: 021000021"),
+            (60, 140, "Account number: 1234567890"),
+        ])
+        counts = redact_ssn.redact_pdf(src, out, redact_bank=True, ocr="all")
+        assert counts["account"] >= 1, counts
+        doc = pymupdf.open(str(out))
+        page = doc[0]
+        # No selectable text remains on the flattened page.
+        assert page.get_text().strip() == "", repr(page.get_text())
+        # The page still renders its non-redacted header (re-OCR finds it),
+        # while the account number is gone.
+        tp = page.get_textpage_ocr(flags=0, dpi=300, full=True,
+                                   tessdata=redact_ssn._find_tessdata())
+        text = page.get_text(textpage=tp)
+        doc.close()
+        assert "Direct Deposit" in text, repr(text)
+        assert "1234567890" not in re.sub(r"\D", "", text), repr(text)
+
+
+@test
 def dump_lines_shows_reconstructed_text():
     with tempfile.TemporaryDirectory() as tmp:
         src = Path(tmp) / "in.pdf"
