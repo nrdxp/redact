@@ -82,6 +82,20 @@ def ssn_dashed_spaced_and_boxed():
 
 
 @test
+def ssn_on_a_line_with_other_numbers():
+    # A dashed SSN sharing a line with other numbers (a table row) must be
+    # redacted without swallowing -- or being defeated by -- its neighbours.
+    with tempfile.TemporaryDirectory() as tmp:
+        counts, texts = run(tmp, [[
+            (72, 60, "Smith, John   123-45-6789   2023   50000"),
+        ]])
+        t = texts[0]
+        assert counts["ssn"] == 1, counts
+        assert "123456789" not in digits(t)
+        assert "2023" in t and "50000" in t
+
+
+@test
 def ssn_leaves_lookalikes_alone():
     with tempfile.TemporaryDirectory() as tmp:
         counts, texts = run(tmp, [[
@@ -122,6 +136,21 @@ def bank_off_by_default():
         assert counts["routing"] == 0 and counts["account"] == 0, counts
         assert "021000021" in digits(texts[0])
         assert "1234567890" in digits(texts[0])
+
+
+@test
+def bank_value_followed_by_other_numbers():
+    # Account number followed by a date on the same line: redact the account,
+    # keep the date.
+    with tempfile.TemporaryDirectory() as tmp:
+        counts, texts = run(tmp, [[
+            (72, 60, "Routing number: 021000021"),
+            (72, 90, "Account: 1234567890   opened 12 31 2020"),
+        ]], redact_bank=True)
+        t = texts[0]
+        assert counts["account"] == 1, counts
+        assert "1234567890" not in digits(t)
+        assert "12 31 2020" in t
 
 
 @test

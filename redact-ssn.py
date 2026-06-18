@@ -236,17 +236,28 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, dry_run=False, verbo
     page_lines = [_build_lines(page) for page in doc]
     known = learn_sequences(page_lines, redact_bank)
 
+    # One matcher per learned sequence: its digits in order, with optional
+    # separators between them, anchored by \b so it won't match as part of a
+    # longer number. Searching for the sequence itself (rather than scanning
+    # for maximal digit-runs and comparing) is what lets a value sitting next
+    # to other numbers on the same line still match exactly, without its
+    # neighbours being merged in and changing the digits.
+    patterns = [
+        (re.compile(r"\b" + r"[ -]*".join(seq) + r"\b"), kind)
+        for seq, kind in known.items()
+    ]
+
     counts = {"ssn": 0, "routing": 0, "account": 0}
     for page_index, lines in enumerate(page_lines):
         page = doc[page_index]
         redacted = set()  # word boxes already marked on this page
         for line in lines:
-            for vm in VALUE_REGEX.finditer(line["text"]):
-                kind = known.get(re.sub(r"\D", "", vm.group()))
-                if kind and _redact_match(page, line["spans"], vm.start(), vm.end(), redacted, dry_run):
-                    counts[kind] += 1
-                    if verbose:
-                        print(f"  page {page_index + 1}: {kind} {vm.group().strip()}", file=sys.stderr)
+            for pattern, kind in patterns:
+                for m in pattern.finditer(line["text"]):
+                    if _redact_match(page, line["spans"], m.start(), m.end(), redacted, dry_run):
+                        counts[kind] += 1
+                        if verbose:
+                            print(f"  page {page_index + 1}: {kind} {m.group().strip()}", file=sys.stderr)
         if not dry_run:
             page.apply_redactions()
 
