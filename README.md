@@ -39,6 +39,13 @@ same problem with no text layer at all.
 numbers are. Because redaction blanks a *rectangle*, this removes the real
 rendered digits regardless of the broken encoding underneath.
 
+OCR is **strictly additive**: it never replaces a page's real text layer, it
+only adds coverage where that text is unreadable. So normal text matching keeps
+working everywhere, even on pages that also get OCR'd. OCR is used only to learn
+*where* to redact — it never rewrites or reflows the page. And pages with
+nothing to redact are written back untouched; only pages that actually have a
+redaction are modified.
+
 ```sh
 ./redact-ssn.py return.pdf --bank --ocr            # OCR only the unreadable pages
 ./redact-ssn.py return.pdf --bank --ocr-all        # OCR every page (slower; if --ocr misses one)

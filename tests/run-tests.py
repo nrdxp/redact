@@ -294,6 +294,21 @@ def unreadable_bank_value_redacts_region():
 
 
 @test
+def pages_without_redactions_are_left_intact():
+    with tempfile.TemporaryDirectory() as tmp:
+        src, out = Path(tmp) / "in.pdf", Path(tmp) / "out.pdf"
+        make_pdf(src, [
+            [(72, 60, "SSN: 123-45-6789")],
+            [(72, 60, "Nothing sensitive here, page two.")],
+        ])
+        redact_ssn.redact_pdf(src, out)
+        doc = pymupdf.open(str(out))
+        assert "123-45-6789" not in doc[0].get_text()
+        assert doc[1].get_text().strip() == "Nothing sensitive here, page two."
+        doc.close()
+
+
+@test
 def garbled_text_is_detected():
     assert redact_ssn._looks_garbled("Ke\x87MR\x88NX\x89YZ\x8c`S\x8dN" * 4)
     assert not redact_ssn._looks_garbled("Account number: 1234567890")

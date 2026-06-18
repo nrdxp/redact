@@ -114,22 +114,26 @@ def _looks_garbled(text):
     return bad / len(text) > 0.01
 
 
-def _page_words(page, ocr, tessdata):
-    """Return (words, used_ocr) for a page.
+def _should_ocr(normal_words, ocr):
+    """Whether to add OCR coverage for a page.
 
-    *ocr* is None (never), "auto" (OCR pages whose text layer is empty or
-    garbled), or "all" (always OCR). OCR finds where text is even when the
-    encoding is broken; redacting those boxes still removes the real glyphs.
+    *ocr* is None (never), "auto" (only when the embedded text is empty or
+    garbled), or "all" (always). OCR is additive -- it never replaces the
+    embedded text layer, only supplements it where that text is unreadable.
     """
-    words = page.get_text("words")
-    need = ocr == "all" or (
-        ocr == "auto" and (not "".join(w[4] for w in words).strip()
-                            or _looks_garbled("".join(w[4] for w in words)))
-    )
-    if need:
-        tp = page.get_textpage_ocr(flags=0, dpi=OCR_DPI, full=True, tessdata=tessdata)
-        return page.get_text("words", textpage=tp), True
-    return words, False
+    if ocr == "all":
+        return True
+    if ocr == "auto":
+        text = "".join(w[4] for w in normal_words)
+        return not text.strip() or _looks_garbled(text)
+    return False
+
+
+def _ocr_words(page, tessdata):
+    """Words recognized by rendering the page and OCRing it. Used only to learn
+    *where* content is (for redaction); the page itself is never modified."""
+    tp = page.get_textpage_ocr(flags=0, dpi=OCR_DPI, full=True, tessdata=tessdata)
+    return page.get_text("words", textpage=tp)
 
 
 def _build_lines(page, words=None):
@@ -260,8 +264,13 @@ def _iter_bank(lines, page_rect, surplus, positional):
     when an unpaired routing number precedes them; *surplus* is the running
     count of such routing matches and is mutated in place (a one-element list).
     """
+    # Only real field headings (label + a "Number"/"#" suffix) bound a region
+    # band. Bounding by any label-ish match would let stray "rout"/"acco"
+    # substrings in garbled OCR text truncate the band before it reaches the
+    # boxes.
     heading_ys = sorted(
-        line["y0"] for line in lines if LABEL_REGEX.search(line["text"])
+        line["y0"] for line in lines
+        if any(lm.group("suffix") for lm in LABEL_REGEX.finditer(line["text"]))
     )
     for i, line in enumerate(lines):
         for lm in LABEL_REGEX.finditer(line["text"]):
@@ -316,6 +325,7 @@ def _iter_bank(lines, page_rect, surplus, positional):
                 y_top = line["y1"]
                 lower = [y for y in heading_ys if y > line["y1"] + 1]
                 y_bot = min([y_top + BAND_MAX_LINES * line_h] + lower[:1])
+                y_bot = max(y_bot, y_top + 1.2 * line_h)  # never an empty band
                 rect = pymupdf.Rect(lx0, y_top, page_rect.width - REGION_MARGIN, y_bot)
                 surplus[0] += 1 if kind == "routing" else -1
                 yield "region", kind, None, rect
@@ -338,16 +348,24 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=Fa
     """
     doc = pymupdf.open(input_pdf)
     tessdata = _find_tessdata() if ocr else None
-    page_lines = []
-    page_ocr = []  # whether each page was OCR'd (enables the region fallback)
+
+    # Per page, build one or more "views" to match against. The embedded text
+    # is always a view; on pages whose text is unreadable, OCR is added as a
+    # second view. OCR is strictly additive -- it never replaces the text layer,
+    # so normal matching keeps working everywhere. Each view carries whether its
+    # boxes came from OCR (which enables the region fallback for that view).
+    page_views = []  # page_index -> list of (lines, from_ocr)
     for page_index, page in enumerate(doc):
-        words, used_ocr = _page_words(page, ocr, tessdata)
-        if used_ocr and verbose:
-            print(f"  page {page_index + 1}: text layer unreadable, using OCR", file=sys.stderr)
-        page_lines.append(_build_lines(page, words))
-        page_ocr.append(used_ocr)
+        normal = page.get_text("words")
+        views = [(_build_lines(page, normal), False)]
+        if ocr and _should_ocr(normal, ocr):
+            if verbose:
+                print(f"  page {page_index + 1}: adding OCR coverage", file=sys.stderr)
+            views.append((_build_lines(page, _ocr_words(page, tessdata)), True))
+        page_views.append(views)
+
     counts = {"ssn": 0, "routing": 0, "account": 0}
-    page_redacted = [set() for _ in page_lines]  # word boxes marked, per page
+    page_redacted = [set() for _ in page_views]  # boxes marked, per page
 
     def record(page_index, kind, ok, label):
         if ok:
@@ -358,25 +376,26 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=Fa
     # Pass 1: contextual rules, redacting exactly what they find.
     known = {}  # normalized digits -> kind
     surplus = [0]  # unpaired routing matches so far, in document order
-    for page_index, lines in enumerate(page_lines):
+    for page_index, views in enumerate(page_views):
         page = doc[page_index]
         redacted = page_redacted[page_index]
-        for line in lines:
-            for m in SSN_REGEX.finditer(line["text"]):
-                known.setdefault(re.sub(r"\D", "", m.group()), "ssn")
-                ok = _redact_match(page, line["spans"], m.start(), m.end(), redacted, dry_run)
-                record(page_index, "ssn", ok, m.group().strip())
-        if redact_bank:
-            for typ, kind, digits, payload in _iter_bank(
-                lines, page.rect, surplus, positional=page_ocr[page_index]
-            ):
-                if typ == "value":
-                    known.setdefault(digits, kind)
-                    ok = _redact_words(page, payload, redacted, dry_run)
-                    record(page_index, kind, ok, digits)
-                else:  # region: digits unreadable, cover the heading's value area
-                    ok = _redact_region(page, payload, redacted, dry_run)
-                    record(page_index, kind, ok, f"[unreadable region under {kind} heading]")
+        for lines, from_ocr in views:
+            for line in lines:
+                for m in SSN_REGEX.finditer(line["text"]):
+                    known.setdefault(re.sub(r"\D", "", m.group()), "ssn")
+                    ok = _redact_match(page, line["spans"], m.start(), m.end(), redacted, dry_run)
+                    record(page_index, "ssn", ok, m.group().strip())
+            if redact_bank:
+                for typ, kind, digits, payload in _iter_bank(
+                    lines, page.rect, surplus, positional=from_ocr
+                ):
+                    if typ == "value":
+                        known.setdefault(digits, kind)
+                        ok = _redact_words(page, payload, redacted, dry_run)
+                        record(page_index, kind, ok, digits)
+                    else:  # region: digits unreadable, cover the heading's value area
+                        ok = _redact_region(page, payload, redacted, dry_run)
+                        record(page_index, kind, ok, f"[unreadable region under {kind} heading]")
 
     # Pass 2: sweep every other occurrence of a learned sequence. One matcher
     # per sequence: its digits in order, tolerant of any separators between them
@@ -389,23 +408,28 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=Fa
         (re.compile(r"(?<!\d)" + sep.join(seq) + r"(?!\d)"), kind)
         for seq, kind in known.items()
     ]
-    for page_index, lines in enumerate(page_lines):
+    for page_index, views in enumerate(page_views):
         page = doc[page_index]
         redacted = page_redacted[page_index]
-        for line in lines:
-            for pattern, kind in patterns:
-                for m in pattern.finditer(line["text"]):
-                    ok = _redact_match(page, line["spans"], m.start(), m.end(), redacted, dry_run)
-                    record(page_index, kind, ok, m.group().strip())
-        if not dry_run:
-            # Pin the redaction mode rather than trust library defaults: TEXT_REMOVE
-            # deletes the underlying text (so it can't be copied or extracted, not
-            # just hidden), and IMAGE_PIXELS blanks the covered pixels of any image
-            # (so a scanned/OCR'd page's digits are erased too).
-            page.apply_redactions(
-                text=pymupdf.PDF_REDACT_TEXT_REMOVE,
-                images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
-            )
+        for lines, from_ocr in views:
+            for line in lines:
+                for pattern, kind in patterns:
+                    for m in pattern.finditer(line["text"]):
+                        ok = _redact_match(page, line["spans"], m.start(), m.end(), redacted, dry_run)
+                        record(page_index, kind, ok, m.group().strip())
+
+    # Apply only on pages that actually have a redaction, so untouched pages are
+    # written back byte-for-byte and their formatting is never disturbed. Pin the
+    # mode: TEXT_REMOVE deletes the underlying text (not copyable/extractable, not
+    # just hidden); IMAGE_PIXELS blanks only the covered pixels of any image.
+    if not dry_run:
+        for page_index in range(len(page_views)):
+            page = doc[page_index]
+            if next(page.annots(types=[pymupdf.PDF_ANNOT_REDACT]), None) is not None:
+                page.apply_redactions(
+                    text=pymupdf.PDF_REDACT_TEXT_REMOVE,
+                    images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
+                )
 
     if not dry_run and sum(counts.values()):
         doc.save(output_pdf, garbage=4, deflate=True)
@@ -424,14 +448,16 @@ def dump_lines(input_pdf, file=sys.stdout, ocr=None):
     doc = pymupdf.open(input_pdf)
     tessdata = _find_tessdata() if ocr else None
     for page_index, page in enumerate(doc, start=1):
-        words, used_ocr = _page_words(page, ocr, tessdata)
-        lines = _build_lines(page, words)
-        tag = " [OCR]" if used_ocr else ""
-        print(f"=== page {page_index} ({len(lines)} lines){tag} ===", file=file)
-        for ln in lines:
-            print(f"  y={ln['y0']:7.1f}  text: {ln['text']!r}", file=file)
-            boxes = "  ".join(f"{w[4]}@{w[0]:.0f}" for w in ln["words"])
-            print(f"             boxes: {boxes}", file=file)
+        normal = page.get_text("words")
+        views = [("text", _build_lines(page, normal))]
+        if ocr and _should_ocr(normal, ocr):
+            views.append(("OCR", _build_lines(page, _ocr_words(page, tessdata))))
+        for tag, lines in views:
+            print(f"=== page {page_index} [{tag}] ({len(lines)} lines) ===", file=file)
+            for ln in lines:
+                print(f"  y={ln['y0']:7.1f}  text: {ln['text']!r}", file=file)
+                boxes = "  ".join(f"{w[4]}@{w[0]:.0f}" for w in ln["words"])
+                print(f"             boxes: {boxes}", file=file)
     doc.close()
 
 
