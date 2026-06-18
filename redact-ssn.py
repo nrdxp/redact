@@ -350,7 +350,14 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=Fa
                     ok = _redact_match(page, line["spans"], m.start(), m.end(), redacted, dry_run)
                     record(page_index, kind, ok, m.group().strip())
         if not dry_run:
-            page.apply_redactions()
+            # Pin the redaction mode rather than trust library defaults: TEXT_REMOVE
+            # deletes the underlying text (so it can't be copied or extracted, not
+            # just hidden), and IMAGE_PIXELS blanks the covered pixels of any image
+            # (so a scanned/OCR'd page's digits are erased too).
+            page.apply_redactions(
+                text=pymupdf.PDF_REDACT_TEXT_REMOVE,
+                images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
+            )
 
     if not dry_run and sum(counts.values()):
         doc.save(output_pdf, garbage=4, deflate=True)
