@@ -258,6 +258,42 @@ def learned_ssn_redacted_even_when_bare_elsewhere():
 # --- cosmetics ------------------------------------------------------------
 
 @test
+def label_tolerates_ocr_typos():
+    # OCR commonly mangles a letter or two ("Routing" -> "Routini"); the label
+    # must still be recognized, or the routing/account pairing silently breaks.
+    m = redact_ssn.LABEL_REGEX.search("Routini Number")
+    assert m and redact_ssn._label_kind(m.group("kind")) == "routing"
+    m = redact_ssn.LABEL_REGEX.search("Account Number")
+    assert m and redact_ssn._label_kind(m.group("kind")) == "account"
+
+
+@test
+def unreadable_bank_value_redacts_region():
+    # Headings read fine but the digits are in boxes OCR can't read (simulated
+    # here by non-digit junk under each heading). On an OCR'd page we fall back
+    # to covering the band beneath each "... Number" heading.
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((40, 100), "Routing Number")
+    page.insert_text((40, 120), "elafefofsfefefofe")     # unreadable routing boxes
+    page.insert_text((40, 150), "Account Number")
+    page.insert_text((40, 170), "yfzfyfzfyfzfyfzfyf")     # unreadable account boxes
+    lines = redact_ssn._build_lines(page)
+    items = list(redact_ssn._iter_bank(lines, page.rect, [0], positional=True))
+    kinds = [(typ, kind) for typ, kind, _, _ in items]
+    assert kinds == [("region", "routing"), ("region", "account")], kinds
+    # Without the positional flag (non-OCR page) nothing is produced.
+    assert list(redact_ssn._iter_bank(lines, page.rect, [0], positional=False)) == []
+    # The region rect actually covers the junk row and removes it.
+    _, _, _, rect = items[0]
+    redacted = set()
+    assert redact_ssn._redact_region(page, rect, redacted, dry_run=False)
+    page.apply_redactions(text=pymupdf.PDF_REDACT_TEXT_REMOVE)
+    assert "elafefofsfefefofe" not in page.get_text()
+    doc.close()
+
+
+@test
 def garbled_text_is_detected():
     assert redact_ssn._looks_garbled("Ke\x87MR\x88NX\x89YZ\x8c`S\x8dN" * 4)
     assert not redact_ssn._looks_garbled("Account number: 1234567890")

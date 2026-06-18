@@ -45,10 +45,22 @@ rendered digits regardless of the broken encoding underneath.
 ./redact-ssn.py return.pdf --ocr --dump            # see what OCR reads, for diagnosis
 ```
 
+Sometimes even OCR can't read the digits — tax forms often have you enter the
+routing/account number one digit per *drawn box*, and OCR can't read digits
+inside cells (and may even mangle the heading, e.g. `Routing` → `Routini`). For
+this, on an OCR'd page, when a recognizable field heading (`Routing Number`,
+`Account Number`, …) has no readable value, the tool falls back to **redacting
+the band directly beneath the heading** — covering the boxed digits by position
+even though it never read them. Heading matching is fuzzy so OCR typos still
+count, and the routing/account pairing still applies. The band runs from just
+under the heading down to the next heading (capped at `BAND_MAX_LINES`).
+
 OCR needs the `tesseract` engine, which the `nix-shell` shebang now pulls in
-automatically. Two caveats: OCR is much slower than text extraction (seconds per
-page), and it can occasionally misread a digit — so on OCR'd pages especially,
-eyeball the result and use `--dry-run -v` to review what was found.
+automatically. Caveats: OCR is much slower than text extraction (seconds per
+page); it can occasionally misread a digit; and the region fallback is
+deliberately broad (it covers the full width beneath a heading). So on OCR'd
+pages especially, eyeball the result and use `--dry-run -v` to review what was
+found.
 
 ## What it matches
 

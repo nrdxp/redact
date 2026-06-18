@@ -36,13 +36,20 @@ import pymupdf
 SSN_REGEX = re.compile(r"\b\d{3}[ -]+\d{2}[ -]+\d{4}\b")
 
 # Bank-info labels. We only redact account/routing numbers that sit next to
-# one of these, since the digits alone are too ambiguous to match safely.
-# The trailing "no"/"number"/"#" and punctuation are tolerated but optional.
+# one of these, since the digits alone are too ambiguous to match safely. The
+# keyword stems are matched loosely (rout\w*, acco\w*) so OCR slips like
+# "Routini" for "Routing" are still recognized. The trailing
+# "no"/"number"/"#" suffix is optional but, when present, marks a field
+# heading (used to gate the more aggressive region fallback below).
 LABEL_REGEX = re.compile(
-    r"\b(?P<kind>account|acct|routing|rtn|aba)\b\.?"
-    r"(?:\s*(?:number|num|no|#))?\.?",
+    r"\b(?P<kind>rout\w*|rtn|aba|acco\w*|acct)\b\.?"
+    r"(?P<suffix>\s*(?:number|num|no|#))?\.?",
     re.I,
 )
+
+# Render-resolution / layout constants for the OCR region fallback.
+BAND_MAX_LINES = 2.5  # how far below a heading to redact when its value is unreadable
+REGION_MARGIN = 36    # right-side page margin left untouched by a region redaction
 
 # A run of digits with optional space/dash separators (e.g. "12 3456 789",
 # "021-000-021"); the count of digits is checked separately per field type.
@@ -196,6 +203,18 @@ def _redact_match(page, spans, start, end, redacted, dry_run):
     return _redact_words(page, words, redacted, dry_run)
 
 
+def _redact_region(page, rect, redacted, dry_run):
+    """Redact a geometric rectangle (used when a value's digits can't be read,
+    so we cover the area they occupy). De-duplicated by rounded coordinates."""
+    key = ("region", round(rect.x0), round(rect.y0), round(rect.x1), round(rect.y1))
+    if key in redacted:
+        return False
+    redacted.add(key)
+    if not dry_run:
+        page.add_redact_annot(rect, fill=(0, 0, 0))
+    return True
+
+
 def _find_value(words, kind):
     """First qualifying value among *words* (reading order), or None.
 
@@ -226,9 +245,14 @@ def _find_value(words, kind):
     return None
 
 
-def _iter_bank_values(lines, surplus):
-    """Yield (kind, digits, words) for each account/routing value anchored to a
-    label -- *words* being the exact boxes covering the value.
+def _iter_bank(lines, page_rect, surplus, positional):
+    """Yield bank redactions for each account/routing label, in document order.
+
+    Each item is ("value", kind, digits, words) when the value's digits could
+    be read (the caller learns the digits and redacts those boxes), or
+    ("region", kind, None, rect) when they couldn't but *positional* is set --
+    the latter covers the area beneath a field heading whose digits are
+    unreadable (e.g. entered into drawn boxes on an OCR'd page).
 
     For each label, the value lives either to its right on the same line or in
     the column beneath it (forms vary), so we take the first qualifying number
@@ -236,6 +260,9 @@ def _iter_bank_values(lines, surplus):
     when an unpaired routing number precedes them; *surplus* is the running
     count of such routing matches and is mutated in place (a one-element list).
     """
+    heading_ys = sorted(
+        line["y0"] for line in lines if LABEL_REGEX.search(line["text"])
+    )
     for i, line in enumerate(lines):
         for lm in LABEL_REGEX.finditer(line["text"]):
             kind = _label_kind(lm.group("kind"))
@@ -260,8 +287,8 @@ def _iter_bank_values(lines, surplus):
             # a couple of lines down and stop at the first value, so an
             # unrelated number further down (a date, an invoice no.) isn't swept
             # in.
+            line_h = max(line["y1"] - line["y0"], 1)
             if not found:
-                line_h = max(line["y1"] - line["y0"], 1)
                 pad = max(lx1 - lx0, 50)
                 for other in lines[i + 1:]:
                     if other["y0"] <= line["y1"]:
@@ -279,7 +306,19 @@ def _iter_bank_values(lines, surplus):
             if found:
                 surplus[0] += 1 if kind == "routing" else -1
                 digits, words = found
-                yield kind, digits, words
+                yield "value", kind, digits, words
+            elif positional and lm.group("suffix"):
+                # Couldn't read the digits, but this is a field heading ("...
+                # Number") on a page we had to OCR -- the value is almost
+                # certainly in drawn boxes OCR can't read. Redact the band just
+                # below the heading, down to the next heading (capped), so the
+                # boxed digits are covered even though we never read them.
+                y_top = line["y1"]
+                lower = [y for y in heading_ys if y > line["y1"] + 1]
+                y_bot = min([y_top + BAND_MAX_LINES * line_h] + lower[:1])
+                rect = pymupdf.Rect(lx0, y_top, page_rect.width - REGION_MARGIN, y_bot)
+                surplus[0] += 1 if kind == "routing" else -1
+                yield "region", kind, None, rect
 
 
 def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=False, verbose=False):
@@ -300,11 +339,13 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=Fa
     doc = pymupdf.open(input_pdf)
     tessdata = _find_tessdata() if ocr else None
     page_lines = []
+    page_ocr = []  # whether each page was OCR'd (enables the region fallback)
     for page_index, page in enumerate(doc):
         words, used_ocr = _page_words(page, ocr, tessdata)
         if used_ocr and verbose:
             print(f"  page {page_index + 1}: text layer unreadable, using OCR", file=sys.stderr)
         page_lines.append(_build_lines(page, words))
+        page_ocr.append(used_ocr)
     counts = {"ssn": 0, "routing": 0, "account": 0}
     page_redacted = [set() for _ in page_lines]  # word boxes marked, per page
 
@@ -326,9 +367,16 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=Fa
                 ok = _redact_match(page, line["spans"], m.start(), m.end(), redacted, dry_run)
                 record(page_index, "ssn", ok, m.group().strip())
         if redact_bank:
-            for kind, digits, words in _iter_bank_values(lines, surplus):
-                known.setdefault(digits, kind)
-                record(page_index, kind, _redact_words(page, words, redacted, dry_run), digits)
+            for typ, kind, digits, payload in _iter_bank(
+                lines, page.rect, surplus, positional=page_ocr[page_index]
+            ):
+                if typ == "value":
+                    known.setdefault(digits, kind)
+                    ok = _redact_words(page, payload, redacted, dry_run)
+                    record(page_index, kind, ok, digits)
+                else:  # region: digits unreadable, cover the heading's value area
+                    ok = _redact_region(page, payload, redacted, dry_run)
+                    record(page_index, kind, ok, f"[unreadable region under {kind} heading]")
 
     # Pass 2: sweep every other occurrence of a learned sequence. One matcher
     # per sequence: its digits in order, tolerant of any separators between them
