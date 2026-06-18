@@ -1,0 +1,6 @@
+# Never commit PDFs — they may contain the very data this tool redacts.
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
