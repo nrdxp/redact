@@ -7,8 +7,9 @@ recovered by copy/paste or text extraction.
 
 ## Usage
 
-The script is self-contained: the `nix-shell` shebang pulls in its only
-dependency (`pymupdf`) on first run, so there's nothing to install.
+The script is self-contained: the `nix-shell` shebang pulls in its dependencies
+(`pymupdf`, plus `tesseract` for `--ocr`) on first run, so there's nothing to
+install.
 
 ```sh
 ./redact-ssn.py return.pdf                 # -> return.redacted.pdf (won't clobber the original)
@@ -62,13 +63,15 @@ Sometimes even OCR can't read the digits — tax forms often have you enter the
 routing/account number one digit per *drawn box*, and OCR can't read digits
 inside cells (and may even mangle the heading, e.g. `Routing` → `Routini`). For
 this, on an OCR'd page, when a recognizable field heading (`Routing Number`,
-`Account Number`, …) has no readable value, the tool falls back to **redacting
-the band directly beneath the heading** — covering the boxed digits by position
-even though it never read them. Heading matching is fuzzy so OCR typos still
-count, and the routing/account pairing still applies. The band runs from just
-under the heading down to the next heading (capped at `BAND_MAX_LINES`).
+`Account Number`, …) has no readable value, the tool falls back to a
+**positional region**: it covers the area from the heading across full width and
+down a fixed band, so the boxed digits are caught whether they sit to the right
+of the heading or beneath it — even though it never read them. Heading matching
+is fuzzy so OCR typos still count, the routing/account pairing still applies, and
+the band is bounded by the next field heading (capped at `BAND_MAX_PT` points;
+the one knob to turn if a field's boxes are taller).
 
-OCR needs the `tesseract` engine, which the `nix-shell` shebang now pulls in
+OCR needs the `tesseract` engine, which the `nix-shell` shebang pulls in
 automatically. Caveats: OCR is much slower than text extraction (seconds per
 page); it can occasionally misread a digit; and the region fallback is
 deliberately broad (it covers the full width beneath a heading). So on OCR'd
@@ -147,9 +150,11 @@ an unrelated number elsewhere. `--dry-run -v` lists every hit so you can check.
 ./tests/run-tests.py
 ```
 
-Self-contained like the tool (the shebang pulls in `pymupdf`). It generates PDF
-fixtures in a temp dir at runtime — no PDFs are committed — and checks each
-matching rule, the false-positive guards, and the consistency sweep.
+Self-contained like the tool (the shebang pulls in `pymupdf` and `tesseract`).
+It generates PDF fixtures in a temp dir at runtime — no PDFs are committed — and
+covers each matching rule, the false-positive guards, the consistency sweep, and
+the OCR paths (garble detection, recovering an image-only page, the typo-tolerant
+labels, the region fallback, and flattening an OCR'd page).
 
 ## A note on trust
 
