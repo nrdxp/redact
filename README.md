@@ -46,15 +46,22 @@ indistinguishable from any other number — so `--bank` only redacts a number
 when it's **anchored to a label**: `account`, `acct`, `routing`, `rtn`, or
 `aba` (with an optional trailing `no.` / `number` / `#`). For each label it
 takes the first qualifying number found either to the **right** of the label or
-in the **column directly beneath** it, since forms place the value in both
-spots. Routing numbers must be exactly 9 digits; account numbers are accepted
+in the **column directly beneath** it, since forms place the value in either
+spot. Routing numbers must be exactly 9 digits; account numbers are accepted
 between 4 and 17 digits.
+
+To suppress false positives, account numbers are **paired with routing
+numbers**: since an account number is meaningless without a routing number and
+the two always appear together on a form (routing first), an `account` label is
+only honored when an as-yet-unpaired routing number precedes it. This rejects
+the word "account" in prose — e.g. *"questions about your account, call
+800-448-2424"* — which has no routing number before it.
 
 Because this leans on layout heuristics (which column, how far below), it's the
 part most worth checking with `--dry-run -v` against your specific forms. The
 window for "beneath the label" is intentionally tight (about two lines) to
 avoid sweeping in an unrelated number from further down the page; if a value
-on your form sits lower than that, let me know and the window is easy to widen.
+on your form sits lower than that, the window is easy to widen.
 
 ## A note on trust
 

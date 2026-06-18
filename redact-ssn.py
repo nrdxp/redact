@@ -50,6 +50,13 @@ VALUE_REGEX = re.compile(r"\d(?:[ -]*\d)*")
 ACCOUNT_MIN_DIGITS = 4
 ACCOUNT_MAX_DIGITS = 17
 
+# An account number is meaningless without a routing number, and on a form the
+# two appear together (routing first). So we pair them: each routing number
+# redacted adds to a running surplus, and an account number is only redacted
+# when an unpaired routing precedes it. This rejects the word "account" in
+# prose (e.g. "questions about your account, call 800-..."), which has no
+# routing match before it.
+
 
 def _label_kind(text):
     """'routing' for any routing-ish keyword, else 'account'."""
@@ -104,23 +111,27 @@ def _build_lines(page):
 
 
 def _redact_match(page, spans, start, end, redacted, dry_run):
-    """Mark every word overlapping the character range [start, end).
+    """Redact every word overlapping the character range [start, end) with a
+    single rectangle spanning them all -- one flat strip rather than a box per
+    word, so a value split across boxes reads the same as a contiguous one.
 
     Returns True if at least one not-yet-marked word was hit, so callers don't
     double-count a value already covered by another rule. The *redacted* set is
     updated even in dry-run so dedup/counts stay consistent; only the actual
     annotation is skipped.
     """
-    hit = False
-    for s, e, word in spans:
-        if s < end and e > start:
-            key = word[:4]
-            if key not in redacted:
-                redacted.add(key)
-                if not dry_run:
-                    page.add_redact_annot(pymupdf.Rect(word[:4]), fill=(0, 0, 0))
-                hit = True
-    return hit
+    words = [word for s, e, word in spans if s < end and e > start]
+    if not any(word[:4] not in redacted for word in words):
+        return False
+    for word in words:
+        redacted.add(word[:4])
+    if not dry_run:
+        strip = pymupdf.Rect(
+            min(w[0] for w in words), min(w[1] for w in words),
+            max(w[2] for w in words), max(w[3] for w in words),
+        )
+        page.add_redact_annot(strip, fill=(0, 0, 0))
+    return True
 
 
 def _first_value(words, kind, page, redacted, dry_run):
@@ -150,18 +161,24 @@ def _first_value(words, kind, page, redacted, dry_run):
     return None
 
 
-def _redact_bank(page, lines, redacted, hits, dry_run):
-    """Redact account/routing numbers anchored to a nearby label.
+def _redact_bank(page, lines, redacted, hits, dry_run, surplus):
+    """Redact account/routing numbers anchored to a label.
 
-    For each label, look for the value both to its right on the same line and
-    in the column beneath it (the layout varies by form), redacting the first
-    qualifying number found in each place.
+    For each label, the value lives either to its right on the same line or in
+    the column beneath it (forms vary), so we take the first qualifying number
+    found in those two places, in that order. Account labels are only honored
+    when an unpaired routing number precedes them; *surplus* is the running
+    count of such routing matches and is mutated in place (a one-element list).
     """
     for i, line in enumerate(lines):
         for lm in LABEL_REGEX.finditer(line["text"]):
             kind = _label_kind(lm.group("kind"))
             label_words = [w for s, e, w in line["spans"] if s < lm.end() and e > lm.start()]
             if not label_words:
+                continue
+            # An account with no preceding routing is almost certainly the word
+            # "account" in prose, not a real account number -- skip it.
+            if kind == "account" and surplus[0] <= 0:
                 continue
             lx0 = min(w[0] for w in label_words)
             lx1 = max(w[2] for w in label_words)
@@ -172,28 +189,30 @@ def _redact_bank(page, lines, redacted, hits, dry_run):
                 key=lambda w: w[0],
             )
             value = _first_value(right, kind, page, redacted, dry_run)
+
+            # Otherwise, in roughly the same column beneath the label. Scan only
+            # a couple of lines down and stop at the first value, so an
+            # unrelated number further down (a date, an invoice no.) isn't swept
+            # in.
+            if not value:
+                line_h = max(line["y1"] - line["y0"], 1)
+                pad = max(lx1 - lx0, 50)
+                for other in lines[i + 1:]:
+                    if other["y0"] <= line["y1"]:
+                        continue
+                    if other["y0"] > line["y1"] + 2 * line_h:
+                        break
+                    column = sorted(
+                        (w for w in other["words"] if lx0 - 10 < w[0] < lx1 + pad),
+                        key=lambda w: w[0],
+                    )
+                    value = _first_value(column, kind, page, redacted, dry_run)
+                    if value:
+                        break
+
             if value:
                 hits.append((kind, value))
-
-            # Below, in roughly the same column (value sits under the label).
-            # Scan downward only a couple of lines and stop at the first that
-            # yields a value, so an unrelated number further down (a date, an
-            # invoice no.) in the same column isn't swept in.
-            line_h = max(line["y1"] - line["y0"], 1)
-            pad = max(lx1 - lx0, 50)
-            for other in lines[i + 1:]:
-                if other["y0"] <= line["y1"]:
-                    continue
-                if other["y0"] > line["y1"] + 2 * line_h:
-                    break
-                column = sorted(
-                    (w for w in other["words"] if lx0 - 10 < w[0] < lx1 + pad),
-                    key=lambda w: w[0],
-                )
-                value = _first_value(column, kind, page, redacted, dry_run)
-                if value:
-                    hits.append((kind, value))
-                    break
+                surplus[0] += 1 if kind == "routing" else -1
 
 
 def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, dry_run=False, verbose=False):
@@ -204,6 +223,7 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, dry_run=False, verbo
     """
     doc = pymupdf.open(input_pdf)
     counts = {"ssn": 0, "routing": 0, "account": 0}
+    surplus = [0]  # unpaired routing matches so far, in document order
 
     for page_index, page in enumerate(doc, start=1):
         lines = _build_lines(page)
@@ -218,7 +238,7 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, dry_run=False, verbo
 
         if redact_bank:
             hits = []
-            _redact_bank(page, lines, redacted, hits, dry_run)
+            _redact_bank(page, lines, redacted, hits, dry_run, surplus)
             for kind, value in hits:
                 counts[kind] += 1
                 if verbose:
