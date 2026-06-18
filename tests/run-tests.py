@@ -194,6 +194,26 @@ def learned_account_redacted_everywhere_even_unlabeled():
 
 
 @test
+def learned_value_matched_despite_different_formatting():
+    # An account learned at its label must still be caught elsewhere when it's
+    # punctuated differently or abuts letters -- but NOT when it's merely part
+    # of a longer number.
+    with tempfile.TemporaryDirectory() as tmp:
+        counts, texts = run(tmp, [
+            [(72, 60, "Routing number: 021000021"),
+             (72, 90, "Account number: 1234567890")],
+            [(72, 60, "Ref. 1.234.567.890 on file")],   # dot separators
+            [(72, 60, "Code Acct1234567890 end")],       # glued to letters
+            [(72, 60, "Order 12345678901234 total")],    # longer number, contains it
+        ], redact_bank=True)
+        assert counts["account"] == 3, counts  # pages 1-3, not page 4
+        assert "1234567890" not in digits(texts[1])          # dot-separated
+        assert "1234567890" not in digits(texts[2])          # glued to letters
+        assert "end" in texts[2]                             # rest of line kept
+        assert "12345678901234" in digits(texts[3])          # longer number untouched
+
+
+@test
 def learned_ssn_redacted_even_when_bare_elsewhere():
     with tempfile.TemporaryDirectory() as tmp:
         counts, texts = run(tmp, [

@@ -236,14 +236,18 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, dry_run=False, verbo
     page_lines = [_build_lines(page) for page in doc]
     known = learn_sequences(page_lines, redact_bank)
 
-    # One matcher per learned sequence: its digits in order, with optional
-    # separators between them, anchored by \b so it won't match as part of a
-    # longer number. Searching for the sequence itself (rather than scanning
-    # for maximal digit-runs and comparing) is what lets a value sitting next
-    # to other numbers on the same line still match exactly, without its
+    # One matcher per learned sequence: its digits in order, tolerant of any
+    # separators between them (space, dash, dot, slash, comma, etc. -- ignored),
+    # so the same number is caught however it's punctuated elsewhere. Bounds are
+    # digit-only lookarounds rather than \b: that still prevents matching as
+    # part of a longer *number*, but -- unlike \b -- still matches when the
+    # number abuts a letter (e.g. "Acct1234567890"). Searching for the sequence
+    # itself (rather than scanning for maximal digit-runs and comparing) also
+    # lets a value sitting next to other numbers match exactly, without its
     # neighbours being merged in and changing the digits.
+    sep = r"[^0-9A-Za-z]*"
     patterns = [
-        (re.compile(r"\b" + r"[ -]*".join(seq) + r"\b"), kind)
+        (re.compile(r"(?<!\d)" + sep.join(seq) + r"(?!\d)"), kind)
         for seq, kind in known.items()
     ]
 
