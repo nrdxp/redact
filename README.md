@@ -63,6 +63,36 @@ window for "beneath the label" is intentionally tight (about two lines) to
 avoid sweeping in an unrelated number from further down the page; if a value
 on your form sits lower than that, the window is easy to widen.
 
+## Document-wide consistency
+
+Redaction runs in two passes. The first **learns** each sensitive number using
+the contextual rules above (an SSN's 3-2-4 shape, a bank number's label). The
+second **sweeps** the whole document and redacts every occurrence of those
+exact digit-sequences — ignoring separators — even where an occurrence doesn't
+match any rule on its own.
+
+So once a number is identified anywhere, it stays redacted everywhere:
+
+- an account number shown with its label on one page is still redacted where it
+  reappears unlabeled on another;
+- an SSN learned from its dashed form is also redacted where it appears as a
+  bare 9-digit run elsewhere (which, with no prior context, would be too
+  ambiguous to catch on its own).
+
+A practical caveat: the sweep matches on the digit-sequence alone, so a short
+learned value (e.g. a 4-digit account number) could in principle collide with
+an unrelated number elsewhere. `--dry-run -v` lists every hit so you can check.
+
+## Tests
+
+```sh
+./tests/run-tests.py
+```
+
+Self-contained like the tool (the shebang pulls in `pymupdf`). It generates PDF
+fixtures in a temp dir at runtime — no PDFs are committed — and checks each
+matching rule, the false-positive guards, and the consistency sweep.
+
 ## A note on trust
 
 Redaction is only as good as the match. Eyeball the output of anything

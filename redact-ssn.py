@@ -134,35 +134,23 @@ def _redact_match(page, spans, start, end, redacted, dry_run):
     return True
 
 
-def _first_value(words, kind, page, redacted, dry_run):
-    """Redact the first qualifying value among *words* (reading order).
+def _find_value(words, kind):
+    """First qualifying value among *words* (reading order), or None.
 
-    Returns the matched text, or None. We stop at the first qualifying run so
-    a far-off number in another column doesn't get swept in with the value
-    that actually belongs to the label.
+    Returns (text, digits) where *digits* is the value with separators
+    stripped. We stop at the first qualifying run so a far-off number in
+    another column isn't taken in place of the value belonging to the label.
     """
-    spans = []
-    parts = []
-    pos = 0
-    for i, word in enumerate(words):
-        if i:
-            parts.append(" ")
-            pos += 1
-        text = word[4]
-        spans.append((pos, pos + len(text), word))
-        parts.append(text)
-        pos += len(text)
-    text = "".join(parts)
-
+    text = " ".join(w[4] for w in words)
     for vm in VALUE_REGEX.finditer(text):
         digits = re.sub(r"\D", "", vm.group())
-        if _qualifies(kind, digits) and _redact_match(page, spans, vm.start(), vm.end(), redacted, dry_run):
-            return vm.group().strip()
+        if _qualifies(kind, digits):
+            return vm.group().strip(), digits
     return None
 
 
-def _redact_bank(page, lines, redacted, hits, dry_run, surplus):
-    """Redact account/routing numbers anchored to a label.
+def _iter_bank_values(lines, surplus):
+    """Yield (kind, digits) for each account/routing value anchored to a label.
 
     For each label, the value lives either to its right on the same line or in
     the column beneath it (forms vary), so we take the first qualifying number
@@ -188,13 +176,13 @@ def _redact_bank(page, lines, redacted, hits, dry_run, surplus):
                 (w for w in line["words"] if w[0] >= lx1 - 1 and w not in label_words),
                 key=lambda w: w[0],
             )
-            value = _first_value(right, kind, page, redacted, dry_run)
+            found = _find_value(right, kind)
 
             # Otherwise, in roughly the same column beneath the label. Scan only
             # a couple of lines down and stop at the first value, so an
             # unrelated number further down (a date, an invoice no.) isn't swept
             # in.
-            if not value:
+            if not found:
                 line_h = max(line["y1"] - line["y0"], 1)
                 pad = max(lx1 - lx0, 50)
                 for other in lines[i + 1:]:
@@ -206,44 +194,59 @@ def _redact_bank(page, lines, redacted, hits, dry_run, surplus):
                         (w for w in other["words"] if lx0 - 10 < w[0] < lx1 + pad),
                         key=lambda w: w[0],
                     )
-                    value = _first_value(column, kind, page, redacted, dry_run)
-                    if value:
+                    found = _find_value(column, kind)
+                    if found:
                         break
 
-            if value:
-                hits.append((kind, value))
+            if found:
                 surplus[0] += 1 if kind == "routing" else -1
+                yield kind, found[1]
+
+
+def learn_sequences(page_lines, redact_bank):
+    """Collect the sensitive digit-sequences in a document via context rules.
+
+    Returns a dict of normalized digits -> kind ('ssn'/'routing'/'account').
+    SSNs are learned from their 3-2-4 pattern; account/routing numbers from a
+    nearby label. These are the sequences the sweep then redacts everywhere.
+    """
+    known = {}
+    surplus = [0]  # unpaired routing matches so far, in document order
+    for lines in page_lines:
+        for line in lines:
+            for match in SSN_REGEX.finditer(line["text"]):
+                known.setdefault(re.sub(r"\D", "", match.group()), "ssn")
+        if redact_bank:
+            for kind, digits in _iter_bank_values(lines, surplus):
+                known.setdefault(digits, kind)
+    return known
 
 
 def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, dry_run=False, verbose=False):
     """Redact sensitive data in *input_pdf*, writing to *output_pdf*.
 
-    Always redacts SSNs; also redacts routing/account numbers when
-    *redact_bank* is set. Returns a dict of per-category counts.
+    Works in two passes: first learn each sensitive number from the contextual
+    rules (SSN pattern, bank labels), then redact every occurrence of those
+    digit-sequences anywhere in the document -- ignoring separators, and
+    regardless of whether that occurrence matches a rule. This keeps a given
+    number redacted consistently throughout, even where it lacks the context
+    that first identified it. Returns a dict of per-category counts.
     """
     doc = pymupdf.open(input_pdf)
+    page_lines = [_build_lines(page) for page in doc]
+    known = learn_sequences(page_lines, redact_bank)
+
     counts = {"ssn": 0, "routing": 0, "account": 0}
-    surplus = [0]  # unpaired routing matches so far, in document order
-
-    for page_index, page in enumerate(doc, start=1):
-        lines = _build_lines(page)
+    for page_index, lines in enumerate(page_lines):
+        page = doc[page_index]
         redacted = set()  # word boxes already marked on this page
-
         for line in lines:
-            for match in SSN_REGEX.finditer(line["text"]):
-                counts["ssn"] += 1
-                if verbose:
-                    print(f"  page {page_index}: SSN {match.group()}", file=sys.stderr)
-                _redact_match(page, line["spans"], match.start(), match.end(), redacted, dry_run)
-
-        if redact_bank:
-            hits = []
-            _redact_bank(page, lines, redacted, hits, dry_run, surplus)
-            for kind, value in hits:
-                counts[kind] += 1
-                if verbose:
-                    print(f"  page {page_index}: {kind} {value}", file=sys.stderr)
-
+            for vm in VALUE_REGEX.finditer(line["text"]):
+                kind = known.get(re.sub(r"\D", "", vm.group()))
+                if kind and _redact_match(page, line["spans"], vm.start(), vm.end(), redacted, dry_run):
+                    counts[kind] += 1
+                    if verbose:
+                        print(f"  page {page_index + 1}: {kind} {vm.group().strip()}", file=sys.stderr)
         if not dry_run:
             page.apply_redactions()
 
