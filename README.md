@@ -65,11 +65,13 @@ on your form sits lower than that, the window is easy to widen.
 
 ## Document-wide consistency
 
-Redaction runs in two passes. The first **learns** each sensitive number using
-the contextual rules above (an SSN's 3-2-4 shape, a bank number's label). The
-second **sweeps** the whole document and redacts every occurrence of those
-exact digit-sequences — ignoring separators — even where an occurrence doesn't
-match any rule on its own.
+Redaction runs in two passes. The first applies the contextual rules above (an
+SSN's 3-2-4 shape, a bank number's label) and **redacts each value directly**,
+using the exact boxes the rule matched — so nothing the rules find can be
+dropped, even in awkward layouts (e.g. one digit per box) — while recording its
+digit-sequence. The second **sweeps** the whole document and redacts every
+*other* occurrence of those sequences — ignoring separators — even where an
+occurrence doesn't match any rule on its own.
 
 So once a number is identified anywhere, it stays redacted everywhere:
 

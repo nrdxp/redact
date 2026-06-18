@@ -154,6 +154,19 @@ def bank_value_followed_by_other_numbers():
 
 
 @test
+def value_in_one_box_per_digit_below_label():
+    # The routing/account fields at the bottom of a 1040 are often one digit
+    # per box. The rule must find and redact it directly from those boxes.
+    with tempfile.TemporaryDirectory() as tmp:
+        rtn = "021000021"
+        boxes = [(80 + i * 16, 92, d) for i, d in enumerate(rtn)]
+        counts, texts = run(tmp, [[(72, 60, "Routing number"), *boxes]],
+                            redact_bank=True)
+        assert counts["routing"] >= 1, counts
+        assert "021000021" not in digits(texts[0])
+
+
+@test
 def account_in_prose_without_routing_is_ignored():
     with tempfile.TemporaryDirectory() as tmp:
         counts, texts = run(tmp, [[

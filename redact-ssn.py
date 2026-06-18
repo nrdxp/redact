@@ -110,18 +110,17 @@ def _build_lines(page):
     return lines
 
 
-def _redact_match(page, spans, start, end, redacted, dry_run):
-    """Redact every word overlapping the character range [start, end) with a
-    single rectangle spanning them all -- one flat strip rather than a box per
-    word, so a value split across boxes reads the same as a contiguous one.
+def _redact_words(page, words, redacted, dry_run):
+    """Redact *words* with a single rectangle spanning them all -- one flat
+    strip rather than a box per word, so a value split across boxes reads the
+    same as a contiguous one.
 
     Returns True if at least one not-yet-marked word was hit, so callers don't
     double-count a value already covered by another rule. The *redacted* set is
     updated even in dry-run so dedup/counts stay consistent; only the actual
     annotation is skipped.
     """
-    words = [word for s, e, word in spans if s < end and e > start]
-    if not any(word[:4] not in redacted for word in words):
+    if not words or not any(word[:4] not in redacted for word in words):
         return False
     for word in words:
         redacted.add(word[:4])
@@ -134,23 +133,45 @@ def _redact_match(page, spans, start, end, redacted, dry_run):
     return True
 
 
+def _redact_match(page, spans, start, end, redacted, dry_run):
+    """Redact the words overlapping the character range [start, end)."""
+    words = [word for s, e, word in spans if s < end and e > start]
+    return _redact_words(page, words, redacted, dry_run)
+
+
 def _find_value(words, kind):
     """First qualifying value among *words* (reading order), or None.
 
-    Returns (text, digits) where *digits* is the value with separators
-    stripped. We stop at the first qualifying run so a far-off number in
-    another column isn't taken in place of the value belonging to the label.
+    Returns (digits, matched_words) where *digits* is the value with
+    separators stripped and *matched_words* are the exact boxes it covers (so
+    the caller can redact them directly). We stop at the first qualifying run
+    so a far-off number in another column isn't taken in place of the value
+    belonging to the label.
     """
-    text = " ".join(w[4] for w in words)
+    spans = []
+    parts = []
+    pos = 0
+    for i, word in enumerate(words):
+        if i:
+            parts.append(" ")
+            pos += 1
+        text = word[4]
+        spans.append((pos, pos + len(text), word))
+        parts.append(text)
+        pos += len(text)
+    text = "".join(parts)
+
     for vm in VALUE_REGEX.finditer(text):
         digits = re.sub(r"\D", "", vm.group())
         if _qualifies(kind, digits):
-            return vm.group().strip(), digits
+            matched = [w for s, e, w in spans if s < vm.end() and e > vm.start()]
+            return digits, matched
     return None
 
 
 def _iter_bank_values(lines, surplus):
-    """Yield (kind, digits) for each account/routing value anchored to a label.
+    """Yield (kind, digits, words) for each account/routing value anchored to a
+    label -- *words* being the exact boxes covering the value.
 
     For each label, the value lives either to its right on the same line or in
     the column beneath it (forms vary), so we take the first qualifying number
@@ -200,68 +221,68 @@ def _iter_bank_values(lines, surplus):
 
             if found:
                 surplus[0] += 1 if kind == "routing" else -1
-                yield kind, found[1]
-
-
-def learn_sequences(page_lines, redact_bank):
-    """Collect the sensitive digit-sequences in a document via context rules.
-
-    Returns a dict of normalized digits -> kind ('ssn'/'routing'/'account').
-    SSNs are learned from their 3-2-4 pattern; account/routing numbers from a
-    nearby label. These are the sequences the sweep then redacts everywhere.
-    """
-    known = {}
-    surplus = [0]  # unpaired routing matches so far, in document order
-    for lines in page_lines:
-        for line in lines:
-            for match in SSN_REGEX.finditer(line["text"]):
-                known.setdefault(re.sub(r"\D", "", match.group()), "ssn")
-        if redact_bank:
-            for kind, digits in _iter_bank_values(lines, surplus):
-                known.setdefault(digits, kind)
-    return known
+                digits, words = found
+                yield kind, digits, words
 
 
 def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, dry_run=False, verbose=False):
     """Redact sensitive data in *input_pdf*, writing to *output_pdf*.
 
-    Works in two passes: first learn each sensitive number from the contextual
-    rules (SSN pattern, bank labels), then redact every occurrence of those
-    digit-sequences anywhere in the document -- ignoring separators, and
-    regardless of whether that occurrence matches a rule. This keeps a given
-    number redacted consistently throughout, even where it lacks the context
-    that first identified it. Returns a dict of per-category counts.
+    Works in two passes. The first applies the contextual rules (SSN pattern,
+    bank labels) and redacts each value it finds *directly*, using the exact
+    boxes the rule matched -- so nothing the rules identify can be lost, even in
+    layouts the text sweep can't reconstruct -- while recording its digit-
+    sequence. The second sweeps the whole document and redacts every *other*
+    occurrence of those sequences, ignoring separators, so a given number stays
+    redacted consistently throughout even where it lacks identifying context.
+    Returns a dict of per-category counts.
     """
     doc = pymupdf.open(input_pdf)
     page_lines = [_build_lines(page) for page in doc]
-    known = learn_sequences(page_lines, redact_bank)
+    counts = {"ssn": 0, "routing": 0, "account": 0}
+    page_redacted = [set() for _ in page_lines]  # word boxes marked, per page
 
-    # One matcher per learned sequence: its digits in order, tolerant of any
-    # separators between them (space, dash, dot, slash, comma, etc. -- ignored),
-    # so the same number is caught however it's punctuated elsewhere. Bounds are
-    # digit-only lookarounds rather than \b: that still prevents matching as
-    # part of a longer *number*, but -- unlike \b -- still matches when the
-    # number abuts a letter (e.g. "Acct1234567890"). Searching for the sequence
-    # itself (rather than scanning for maximal digit-runs and comparing) also
-    # lets a value sitting next to other numbers match exactly, without its
-    # neighbours being merged in and changing the digits.
+    def record(page_index, kind, ok, label):
+        if ok:
+            counts[kind] += 1
+            if verbose:
+                print(f"  page {page_index + 1}: {kind} {label}", file=sys.stderr)
+
+    # Pass 1: contextual rules, redacting exactly what they find.
+    known = {}  # normalized digits -> kind
+    surplus = [0]  # unpaired routing matches so far, in document order
+    for page_index, lines in enumerate(page_lines):
+        page = doc[page_index]
+        redacted = page_redacted[page_index]
+        for line in lines:
+            for m in SSN_REGEX.finditer(line["text"]):
+                known.setdefault(re.sub(r"\D", "", m.group()), "ssn")
+                ok = _redact_match(page, line["spans"], m.start(), m.end(), redacted, dry_run)
+                record(page_index, "ssn", ok, m.group().strip())
+        if redact_bank:
+            for kind, digits, words in _iter_bank_values(lines, surplus):
+                known.setdefault(digits, kind)
+                record(page_index, kind, _redact_words(page, words, redacted, dry_run), digits)
+
+    # Pass 2: sweep every other occurrence of a learned sequence. One matcher
+    # per sequence: its digits in order, tolerant of any separators between them
+    # (space, dash, dot, comma, etc. -- ignored), so the same number is caught
+    # however it's punctuated. Bounds are digit-only lookarounds rather than \b:
+    # that still prevents matching as part of a longer *number*, but -- unlike
+    # \b -- still matches when the number abuts a letter (e.g. "Acct1234567890").
     sep = r"[^0-9A-Za-z]*"
     patterns = [
         (re.compile(r"(?<!\d)" + sep.join(seq) + r"(?!\d)"), kind)
         for seq, kind in known.items()
     ]
-
-    counts = {"ssn": 0, "routing": 0, "account": 0}
     for page_index, lines in enumerate(page_lines):
         page = doc[page_index]
-        redacted = set()  # word boxes already marked on this page
+        redacted = page_redacted[page_index]
         for line in lines:
             for pattern, kind in patterns:
                 for m in pattern.finditer(line["text"]):
-                    if _redact_match(page, line["spans"], m.start(), m.end(), redacted, dry_run):
-                        counts[kind] += 1
-                        if verbose:
-                            print(f"  page {page_index + 1}: {kind} {m.group().strip()}", file=sys.stderr)
+                    ok = _redact_match(page, line["spans"], m.start(), m.end(), redacted, dry_run)
+                    record(page_index, kind, ok, m.group().strip())
         if not dry_run:
             page.apply_redactions()
 
