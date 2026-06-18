@@ -1,5 +1,5 @@
 #!/usr/bin/env nix-shell
-#!nix-shell -i python3 -p python3Packages.pymupdf
+#!nix-shell -i python3 -p python3Packages.pymupdf tesseract
 """Test suite for redact-ssn.py.
 
 Self-contained like the tool itself: run it directly and the nix-shell shebang
@@ -42,6 +42,23 @@ def make_pdf(path, pages):
             page.insert_text((x, y), text)
     doc.save(str(path))
     doc.close()
+
+
+def make_image_pdf(path, lines, fontsize=18):
+    """Write a PDF whose text is rendered then rasterized to an image, so it
+    has no extractable text layer at all -- forcing the OCR path. *lines* is a
+    list of (x, y, text)."""
+    doc = pymupdf.open()
+    page = doc.new_page()
+    tmp = pymupdf.open()
+    tpage = tmp.new_page(width=page.rect.width, height=page.rect.height)
+    for x, y, text in lines:
+        tpage.insert_text((x, y), text, fontsize=fontsize)
+    pix = tpage.get_pixmap(dpi=200)
+    page.insert_image(page.rect, pixmap=pix)
+    doc.save(str(path))
+    doc.close()
+    tmp.close()
 
 
 def run(tmp, pages, **kwargs):
@@ -239,6 +256,39 @@ def learned_ssn_redacted_even_when_bare_elsewhere():
 
 
 # --- cosmetics ------------------------------------------------------------
+
+@test
+def garbled_text_is_detected():
+    assert redact_ssn._looks_garbled("Ke\x87MR\x88NX\x89YZ\x8c`S\x8dN" * 4)
+    assert not redact_ssn._looks_garbled("Account number: 1234567890")
+    assert not redact_ssn._looks_garbled("")
+
+
+@test
+def ocr_recovers_text_without_a_text_layer():
+    # A page with no text layer (image only) is invisible to the matcher until
+    # OCR is turned on; then its rendered digits get found and redacted.
+    with tempfile.TemporaryDirectory() as tmp:
+        src, out = Path(tmp) / "in.pdf", Path(tmp) / "out.pdf"
+        make_image_pdf(src, [
+            (72, 80, "Routing number: 021000021"),
+            (72, 140, "Account number: 1234567890"),
+        ])
+        # Without OCR there's no text to match, so nothing is redacted.
+        assert redact_ssn.redact_pdf(src, out, redact_bank=True) == {
+            "ssn": 0, "routing": 0, "account": 0}
+        # With OCR the rendered numbers are found and redacted.
+        counts = redact_ssn.redact_pdf(src, out, redact_bank=True, ocr="all")
+        assert counts["account"] >= 1 and counts["routing"] >= 1, counts
+        # The redaction blacks out the pixels, so re-OCR no longer reads them.
+        check = pymupdf.open(str(out))
+        pg = check[0]
+        tp = pg.get_textpage_ocr(flags=0, dpi=300, full=True,
+                                 tessdata=redact_ssn._find_tessdata())
+        text = pg.get_text(textpage=tp)
+        check.close()
+        assert "1234567890" not in re.sub(r"\D", "", text), repr(text)
+
 
 @test
 def dump_lines_shows_reconstructed_text():

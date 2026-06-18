@@ -26,6 +26,30 @@ it to diagnose a value that isn't being caught — it shows whether the digits
 land on one line or get split across several — and it's safe to share once you
 X out the actual digits.
 
+## Unreadable pages (`--ocr`)
+
+Some PDFs — tax-software worksheets are a common offender — contain pages whose
+font has no usable character map. The glyphs render fine (so it looks like text
+and copies in a viewer), but the *extracted* text is scrambled gibberish, so the
+matcher never sees the real digits and can't redact them. Scanned pages have the
+same problem with no text layer at all.
+
+`--ocr` handles both: it detects pages whose text is garbled or missing and
+**OCRs them** (renders the page and recognizes the glyphs) to find where the
+numbers are. Because redaction blanks a *rectangle*, this removes the real
+rendered digits regardless of the broken encoding underneath.
+
+```sh
+./redact-ssn.py return.pdf --bank --ocr            # OCR only the unreadable pages
+./redact-ssn.py return.pdf --bank --ocr-all        # OCR every page (slower; if --ocr misses one)
+./redact-ssn.py return.pdf --ocr --dump            # see what OCR reads, for diagnosis
+```
+
+OCR needs the `tesseract` engine, which the `nix-shell` shebang now pulls in
+automatically. Two caveats: OCR is much slower than text extraction (seconds per
+page), and it can occasionally misread a digit — so on OCR'd pages especially,
+eyeball the result and use `--dry-run -v` to review what was found.
+
 ## What it matches
 
 The 3-2-4 digit grouping with a dash **or** whitespace between groups:

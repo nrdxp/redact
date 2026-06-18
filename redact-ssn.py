@@ -1,5 +1,5 @@
 #!/usr/bin/env nix-shell
-#!nix-shell -i python3 -p python3Packages.pymupdf
+#!nix-shell -i python3 -p python3Packages.pymupdf tesseract
 """Redact sensitive data from a PDF.
 
 Scans every page and paints an opaque box over each match, removing the
@@ -21,7 +21,10 @@ Matching happens within a single visual line (words clustered by vertical
 position), so groups are never joined across a line break.
 """
 import argparse
+import glob
+import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -70,7 +73,59 @@ def _qualifies(kind, digits):
     return ACCOUNT_MIN_DIGITS <= len(digits) <= ACCOUNT_MAX_DIGITS
 
 
-def _build_lines(page):
+OCR_DPI = 300  # render resolution for OCR; high enough for small digits
+
+
+def _find_tessdata():
+    """Locate Tesseract's tessdata dir (env var, PATH, or the nix store)."""
+    env = os.environ.get("TESSDATA_PREFIX")
+    if env and os.path.exists(os.path.join(env, "eng.traineddata")):
+        return env
+    exe = shutil.which("tesseract")
+    if exe:
+        cand = os.path.normpath(os.path.join(os.path.dirname(exe), "..", "share", "tessdata"))
+        if os.path.exists(os.path.join(cand, "eng.traineddata")):
+            return cand
+    for cand in glob.glob("/nix/store/*tesseract*/share/tessdata"):
+        if os.path.exists(os.path.join(cand, "eng.traineddata")):
+            return cand
+    return None
+
+
+def _looks_garbled(text):
+    """True if *text* is mostly unreadable -- a sign the page's font has no
+    usable ToUnicode map, so extraction yields scrambled characters even
+    though the glyphs render fine. Control and C1 characters (rare in real
+    text) are the tell.
+    """
+    if not text:
+        return False
+    bad = sum(
+        1 for c in text
+        if (ord(c) < 0x20 and c not in "\t\n\r\f") or 0x7F <= ord(c) <= 0x9F
+    )
+    return bad / len(text) > 0.01
+
+
+def _page_words(page, ocr, tessdata):
+    """Return (words, used_ocr) for a page.
+
+    *ocr* is None (never), "auto" (OCR pages whose text layer is empty or
+    garbled), or "all" (always OCR). OCR finds where text is even when the
+    encoding is broken; redacting those boxes still removes the real glyphs.
+    """
+    words = page.get_text("words")
+    need = ocr == "all" or (
+        ocr == "auto" and (not "".join(w[4] for w in words).strip()
+                            or _looks_garbled("".join(w[4] for w in words)))
+    )
+    if need:
+        tp = page.get_textpage_ocr(flags=0, dpi=OCR_DPI, full=True, tessdata=tessdata)
+        return page.get_text("words", textpage=tp), True
+    return words, False
+
+
+def _build_lines(page, words=None):
     """Return visual lines, each with its words, reconstructed text, and a
     char-offset -> bounding-box map.
 
@@ -80,8 +135,10 @@ def _build_lines(page):
     different blocks/lines. So we cluster purely by vertical overlap, which
     rejoins those boxes (and any same-line text) regardless of structure.
     """
+    if words is None:
+        words = page.get_text("words")
     clusters = []  # each: [y0, y1, [words...]]
-    for word in sorted(page.get_text("words"), key=lambda w: w[1]):
+    for word in sorted(words, key=lambda w: w[1]):
         y0, y1 = word[1], word[3]
         for c in clusters:
             overlap = min(y1, c[1]) - max(y0, c[0])
@@ -225,7 +282,7 @@ def _iter_bank_values(lines, surplus):
                 yield kind, digits, words
 
 
-def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, dry_run=False, verbose=False):
+def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, ocr=None, dry_run=False, verbose=False):
     """Redact sensitive data in *input_pdf*, writing to *output_pdf*.
 
     Works in two passes. The first applies the contextual rules (SSN pattern,
@@ -235,10 +292,19 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, dry_run=False, verbo
     sequence. The second sweeps the whole document and redacts every *other*
     occurrence of those sequences, ignoring separators, so a given number stays
     redacted consistently throughout even where it lacks identifying context.
-    Returns a dict of per-category counts.
+
+    *ocr* (None / "auto" / "all") controls OCR for pages whose embedded text is
+    unreadable (broken font encoding) or absent (scanned). Returns a dict of
+    per-category counts.
     """
     doc = pymupdf.open(input_pdf)
-    page_lines = [_build_lines(page) for page in doc]
+    tessdata = _find_tessdata() if ocr else None
+    page_lines = []
+    for page_index, page in enumerate(doc):
+        words, used_ocr = _page_words(page, ocr, tessdata)
+        if used_ocr and verbose:
+            print(f"  page {page_index + 1}: text layer unreadable, using OCR", file=sys.stderr)
+        page_lines.append(_build_lines(page, words))
     counts = {"ssn": 0, "routing": 0, "account": 0}
     page_redacted = [set() for _ in page_lines]  # word boxes marked, per page
 
@@ -292,17 +358,21 @@ def redact_pdf(input_pdf, output_pdf, *, redact_bank=False, dry_run=False, verbo
     return counts
 
 
-def dump_lines(input_pdf, file=sys.stdout):
+def dump_lines(input_pdf, file=sys.stdout, ocr=None):
     """Print the exact text the matcher sees: each page's visual lines (the
     reconstructed text both passes run against) plus the underlying word boxes
     and their x-positions. Use this to see how a stubborn value is laid out --
     e.g. whether its digits land on one line or get split across several -- and
-    share it safely by X-ing out the actual digits.
+    share it safely by X-ing out the actual digits. Pass *ocr* to dump what OCR
+    sees on pages whose embedded text is unreadable.
     """
     doc = pymupdf.open(input_pdf)
+    tessdata = _find_tessdata() if ocr else None
     for page_index, page in enumerate(doc, start=1):
-        lines = _build_lines(page)
-        print(f"=== page {page_index} ({len(lines)} lines) ===", file=file)
+        words, used_ocr = _page_words(page, ocr, tessdata)
+        lines = _build_lines(page, words)
+        tag = " [OCR]" if used_ocr else ""
+        print(f"=== page {page_index} ({len(lines)} lines){tag} ===", file=file)
         for ln in lines:
             print(f"  y={ln['y0']:7.1f}  text: {ln['text']!r}", file=file)
             boxes = "  ".join(f"{w[4]}@{w[0]:.0f}" for w in ln["words"])
@@ -349,10 +419,22 @@ def parse_args(argv=None):
         help="print each matched item and its page",
     )
     parser.add_argument(
+        "--ocr", action="store_true",
+        help="OCR pages whose text layer is unreadable (broken font encoding) or absent (scanned)",
+    )
+    parser.add_argument(
+        "--ocr-all", action="store_true",
+        help="OCR every page, ignoring the embedded text (slow; use if --ocr misses a page)",
+    )
+    parser.add_argument(
         "--dump", action="store_true",
         help="print the reconstructed text the matcher sees, then exit (for diagnosing misses)",
     )
     return parser.parse_args(argv)
+
+
+def _ocr_mode(args):
+    return "all" if args.ocr_all else "auto" if args.ocr else None
 
 
 def _summary(counts):
@@ -368,8 +450,10 @@ def main(argv=None):
     if not args.input.is_file():
         sys.exit(f"error: input file not found: {args.input}")
 
+    ocr = _ocr_mode(args)
+
     if args.dump:
-        dump_lines(args.input)
+        dump_lines(args.input, ocr=ocr)
         return
 
     if args.dry_run:
@@ -389,14 +473,14 @@ def main(argv=None):
         if args.in_place and not args.dry_run:
             # Redact to a temp file first so a failure can't corrupt the original.
             tmp = args.input.with_suffix(args.input.suffix + ".tmp")
-            counts = redact_pdf(args.input, tmp, redact_bank=args.bank, verbose=args.verbose)
+            counts = redact_pdf(args.input, tmp, redact_bank=args.bank, ocr=ocr, verbose=args.verbose)
             if sum(counts.values()):
                 tmp.replace(args.input)
             elif tmp.exists():
                 tmp.unlink()
         else:
             counts = redact_pdf(
-                args.input, output, redact_bank=args.bank,
+                args.input, output, redact_bank=args.bank, ocr=ocr,
                 dry_run=args.dry_run, verbose=args.verbose,
             )
     except Exception as exc:  # pymupdf raises a variety of error types
