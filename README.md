@@ -1,8 +1,9 @@
 # redact-ssn
 
-A small, self-contained CLI that redacts U.S. Social Security Numbers from a
-PDF — removing the underlying text, not just drawing a box over it, so the
-digits can't be recovered by copy/paste or text extraction.
+A small, self-contained CLI that redacts U.S. Social Security Numbers — and,
+optionally, bank account/routing numbers — from a PDF. It removes the
+underlying text, not just drawing a box over it, so the digits can't be
+recovered by copy/paste or text extraction.
 
 ## Usage
 
@@ -11,6 +12,7 @@ dependency (`pymupdf`) on first run, so there's nothing to install.
 
 ```sh
 ./redact-ssn.py return.pdf                 # -> return.redacted.pdf (won't clobber the original)
+./redact-ssn.py return.pdf --bank          # also redact account + routing numbers
 ./redact-ssn.py return.pdf -o clean.pdf    # explicit output path
 ./redact-ssn.py return.pdf --in-place      # overwrite the original (written via a temp file first)
 ./redact-ssn.py return.pdf --dry-run -v    # list what would be redacted, write nothing
@@ -36,6 +38,23 @@ A consequence: three numbers in adjacent table columns that happen to form a
 3-2-4 shape can match. That's rare, and something shaped exactly like an SSN
 is usually worth redacting anyway — but always sanity-check with `--dry-run -v`
 before sharing a document.
+
+## Bank account & routing numbers (`--bank`)
+
+Account and routing numbers can't be matched by shape alone — their digits are
+indistinguishable from any other number — so `--bank` only redacts a number
+when it's **anchored to a label**: `account`, `acct`, `routing`, `rtn`, or
+`aba` (with an optional trailing `no.` / `number` / `#`). For each label it
+takes the first qualifying number found either to the **right** of the label or
+in the **column directly beneath** it, since forms place the value in both
+spots. Routing numbers must be exactly 9 digits; account numbers are accepted
+between 4 and 17 digits.
+
+Because this leans on layout heuristics (which column, how far below), it's the
+part most worth checking with `--dry-run -v` against your specific forms. The
+window for "beneath the label" is intentionally tight (about two lines) to
+avoid sweeping in an unrelated number from further down the page; if a value
+on your form sits lower than that, let me know and the window is easy to widen.
 
 ## A note on trust
 
